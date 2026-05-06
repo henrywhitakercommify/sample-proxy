@@ -1,0 +1,9 @@
+services:
+  proxy:
+    build:
+      dockerfile: Dockerfile
+      context: .
+    ports:
+      - 8080:8080
+    environment:
+      - ORIGIN_URL=https://http-mock.voiceandsms.com
