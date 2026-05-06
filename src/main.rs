@@ -3,7 +3,7 @@ use axum::{
     extract::{Request, State},
     http::{HeaderValue, StatusCode, header::HOST},
     response::{IntoResponse, Response},
-    routing::any,
+    routing::{any, get},
     Router,
 };
 use tracing::{error, info};
@@ -45,11 +45,23 @@ async fn main() {
         host,
     };
 
-    let app = Router::new().fallback(any(handler)).with_state(state);
+    let app = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .fallback(any(handler))
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     info!(origin = %origin, addr = %listener.local_addr().unwrap(), "listening");
     axum::serve(listener, app).await.unwrap();
+}
+
+async fn healthz() -> &'static str {
+    "ok"
+}
+
+async fn readyz() -> &'static str {
+    "ok"
 }
 
 async fn handler(State(state): State<AppState>, req: Request) -> Response {
