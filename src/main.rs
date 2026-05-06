@@ -1,6 +1,20 @@
-use axum::{routing::any, Router};
-use tracing::info;
+use axum::{
+    body::Body,
+    extract::{Request, State},
+    http::{HeaderValue, StatusCode, header::HOST},
+    response::{IntoResponse, Response},
+    routing::any,
+    Router,
+};
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+
+#[derive(Clone)]
+struct AppState {
+    client: reqwest::Client,
+    origin: String,
+    host: HeaderValue,
+}
 
 #[tokio::main]
 async fn main() {
@@ -13,14 +27,77 @@ async fn main() {
         .with_file(true)
         .init();
 
-    let app = Router::new().fallback(any(handler));
+    let origin = std::env::var("ORIGIN_URL")
+        .expect("ORIGIN_URL must be set")
+        .trim_end_matches('/')
+        .to_string();
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    info!("listening on {}", listener.local_addr().unwrap());
+    let parsed = reqwest::Url::parse(&origin).expect("ORIGIN_URL must be a valid URL");
+    let host_str = match parsed.port() {
+        Some(p) => format!("{}:{}", parsed.host_str().expect("ORIGIN_URL must have a host"), p),
+        None => parsed.host_str().expect("ORIGIN_URL must have a host").to_string(),
+    };
+    let host = HeaderValue::from_str(&host_str).expect("ORIGIN_URL host must be valid");
+
+    let state = AppState {
+        client: reqwest::Client::new(),
+        origin: origin.clone(),
+        host,
+    };
+
+    let app = Router::new().fallback(any(handler)).with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+    info!(origin = %origin, addr = %listener.local_addr().unwrap(), "listening");
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn handler(req: axum::extract::Request) -> &'static str {
-    info!(method = %req.method(), uri = %req.uri(), headers = ?req.headers(), "request");
-    "ok"
+async fn handler(State(state): State<AppState>, req: Request) -> Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let mut headers = req.headers().clone();
+    info!(method = %method, uri = %uri, headers = ?headers, "request");
+    headers.insert(HOST, state.host.clone());
+
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or(uri.path());
+    let target = format!("{}{}", state.origin, path_and_query);
+
+    let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => {
+            error!(error = %e, "failed to read request body");
+            return (StatusCode::BAD_REQUEST, "failed to read body").into_response();
+        }
+    };
+
+    let upstream = match state
+        .client
+        .request(method, &target)
+        .headers(headers)
+        .body(body_bytes)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            error!(error = %e, target = %target, "upstream request failed");
+            return (StatusCode::BAD_GATEWAY, "upstream request failed").into_response();
+        }
+    };
+
+    let status = upstream.status();
+    let resp_headers = upstream.headers().clone();
+    let stream = upstream.bytes_stream();
+
+    let mut builder = Response::builder().status(status);
+    if let Some(h) = builder.headers_mut() {
+        *h = resp_headers;
+    }
+    builder.body(Body::from_stream(stream)).unwrap_or_else(|e| {
+        error!(error = %e, "failed to build response");
+        (StatusCode::INTERNAL_SERVER_ERROR, "response build failed").into_response()
+    })
 }
