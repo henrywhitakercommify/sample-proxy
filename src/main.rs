@@ -1,11 +1,15 @@
+use std::net::SocketAddr;
+
 use axum::{
     body::Body,
-    extract::{Request, State},
-    http::{HeaderValue, StatusCode, header::HOST},
+    extract::{ConnectInfo, Request, State},
+    http::{header::HOST, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get},
     Router,
 };
+
+const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -34,8 +38,15 @@ async fn main() {
 
     let parsed = reqwest::Url::parse(&origin).expect("ORIGIN_URL must be a valid URL");
     let host_str = match parsed.port() {
-        Some(p) => format!("{}:{}", parsed.host_str().expect("ORIGIN_URL must have a host"), p),
-        None => parsed.host_str().expect("ORIGIN_URL must have a host").to_string(),
+        Some(p) => format!(
+            "{}:{}",
+            parsed.host_str().expect("ORIGIN_URL must have a host"),
+            p
+        ),
+        None => parsed
+            .host_str()
+            .expect("ORIGIN_URL must have a host")
+            .to_string(),
     };
     let host = HeaderValue::from_str(&host_str).expect("ORIGIN_URL host must be valid");
 
@@ -53,7 +64,12 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     info!(origin = %origin, addr = %listener.local_addr().unwrap(), "listening");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
 
 async fn healthz() -> &'static str {
@@ -64,12 +80,21 @@ async fn readyz() -> &'static str {
     "ok"
 }
 
-async fn handler(State(state): State<AppState>, req: Request) -> Response {
+async fn handler(
+    State(state): State<AppState>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    req: Request,
+) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
     let mut headers = req.headers().clone();
-    info!(method = %method, uri = %uri, headers = ?headers, "request");
+    info!(method = %method, uri = %uri, remote = %remote, headers = ?headers, "request");
     headers.insert(HOST, state.host.clone());
+    if !headers.contains_key(&X_FORWARDED_FOR) {
+        if let Ok(v) = HeaderValue::from_str(&remote.ip().to_string()) {
+            headers.insert(X_FORWARDED_FOR, v);
+        }
+    }
 
     let path_and_query = uri
         .path_and_query()
